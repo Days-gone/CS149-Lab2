@@ -2,8 +2,14 @@
 #define _TASKSYS_H
 
 #include "itasksys.h"
+#include <atomic>
 #include <cmath>
+#include <functional>
+#include <mutex>
+#include <queue>
 #include <thread>
+#include <utility>
+#include <vector>
 
 /*
  * TaskSystemSerial: This class is the student's implementation of a
@@ -54,6 +60,15 @@ public:
   TaskID runAsyncWithDeps(IRunnable *runnable, int num_total_tasks,
                           const std::vector<TaskID> &deps);
   void sync();
+
+  int num_threads_;
+  std::mutex mtx_;
+  std::atomic_bool stop_;
+  std::atomic_int task_remained_;
+  std::atomic_int task_total_;
+  std::queue<int> tasks_;
+  std::vector<std::thread> ths_;
+  IRunnable *cur_func_;
 };
 
 /*

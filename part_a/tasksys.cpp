@@ -1,4 +1,8 @@
 #include "tasksys.h"
+#include "itasksys.h"
+#include <cstddef>
+#include <mutex>
+#include <thread>
 
 IRunnable::~IRunnable() {}
 
@@ -102,28 +106,68 @@ const char *TaskSystemParallelThreadPoolSpinning::name() {
 
 TaskSystemParallelThreadPoolSpinning::TaskSystemParallelThreadPoolSpinning(
     int num_threads)
-    : ITaskSystem(num_threads) {
-  //
-  // TODO: CS149 student implementations may decide to perform setup
-  // operations (such as thread pool construction) here.
-  // Implementations are free to add new class member variables
-  // (requiring changes to tasksys.h).
-  //
+    : ITaskSystem(num_threads), num_threads_(num_threads), stop_(false),
+      task_remained_(0), task_total_(0), cur_func_(nullptr) {
+
+  for (int i = 0; i < num_threads_; i++) {
+    ths_.emplace_back([this]() {
+      while (true) {
+
+        // 先检查是否退出，顺带获取任务id
+        bool empty = false;
+        int idx = -1;
+        IRunnable *local_func_{nullptr};
+        {
+          std::lock_guard<std::mutex> lg(mtx_);
+          empty = tasks_.empty();
+          if (!tasks_.empty()) {
+            idx = tasks_.front();
+            tasks_.pop();
+          }
+          local_func_ = cur_func_;
+        }
+        if (stop_ && empty) {
+          break;
+        }
+        if (empty || local_func_ == nullptr) {
+          continue;
+        }
+        // 执行任务
+        local_func_->runTask(idx, this->task_total_);
+        task_remained_--;
+      }
+    });
+  }
 }
 
-TaskSystemParallelThreadPoolSpinning::~TaskSystemParallelThreadPoolSpinning() {}
+TaskSystemParallelThreadPoolSpinning::~TaskSystemParallelThreadPoolSpinning() {
+  stop_ = true;
+  for (auto &t : ths_) {
+    t.join();
+  }
+  ths_.clear();
+}
 
 void TaskSystemParallelThreadPoolSpinning::run(IRunnable *runnable,
                                                int num_total_tasks) {
+  {
+    std::lock_guard<std::mutex> lg(mtx_);
+    while (!tasks_.empty())
+      tasks_.pop();
 
-  //
-  // TODO: CS149 students will modify the implementation of this
-  // method in Part A.  The implementation provided below runs all
-  // tasks sequentially on the calling thread.
-  //
-
-  for (int i = 0; i < num_total_tasks; i++) {
-    runnable->runTask(i, num_total_tasks);
+    cur_func_ = runnable;
+    task_total_ = num_total_tasks;
+    task_remained_ = num_total_tasks;
+    for (int i = 0; i < num_total_tasks; i++) {
+      tasks_.push(i);
+    }
+  }
+  while (task_remained_ > 0) {
+    std::this_thread::yield();
+  }
+  {
+    std::lock_guard<std::mutex> lg(mtx_);
+    cur_func_ = nullptr;
   }
 }
 
