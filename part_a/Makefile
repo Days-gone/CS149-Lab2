@@ -17,13 +17,21 @@ PPM_OBJ=$(addprefix $(OBJDIR)/, $(subst $(COMMONDIR)/,, $(PPM_CXX:.cpp=.o)))
 
 default: $(APP_NAME)
 
-.PHONY: dirs clean
+.PHONY: dirs clean compile
 
 dirs:
 	/bin/mkdir -p $(OBJDIR)/
 
 clean:
-	/bin/rm -rf $(OBJDIR) *.ppm *~ $(APP_NAME)
+	/bin/rm -rf $(OBJDIR) *.ppm *~ $(APP_NAME) compile_commands.json
+
+compile:
+	bear -- make
+
+test: default
+	./runtasks -n 16 mandelbrot_chunked
+	clear
+	python3 ../tests/run_test_harness.py -t super_super_light super_light
 
 OBJS=$(PPM_OBJ) $(OBJDIR)/tasksys.o
 
@@ -35,3 +43,5 @@ $(OBJDIR)/%.o: $(COMMONDIR)/%.cpp
 
 $(OBJDIR)/%.o: %.cpp
 	$(CXX) $< $(CXXFLAGS) -c -o $@
+
+
