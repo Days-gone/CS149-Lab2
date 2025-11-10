@@ -4,6 +4,7 @@
 #include "itasksys.h"
 #include <atomic>
 #include <cmath>
+#include <condition_variable>
 #include <functional>
 #include <mutex>
 #include <queue>
@@ -86,6 +87,17 @@ public:
   TaskID runAsyncWithDeps(IRunnable *runnable, int num_total_tasks,
                           const std::vector<TaskID> &deps);
   void sync();
+
+  int num_threads_;
+  std::mutex mtx_;
+  bool stop_;
+  int task_total_;
+  int task_remained_;
+  std::queue<int> tasks_;
+  std::condition_variable cv_task_;
+  std::condition_variable cv_done_;
+  std::vector<std::thread> ths_;
+  IRunnable* cur_func_;
 };
 
 #endif
