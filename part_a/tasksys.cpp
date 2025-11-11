@@ -206,7 +206,7 @@ TaskSystemParallelThreadPoolSleeping::TaskSystemParallelThreadPoolSleeping(
         // 获取任务
         {
           std::unique_lock<std::mutex> lg(mtx_);
-          cv_task_.wait(lg,
+          cv_ready_.wait(lg,
                         [this]() { return !this->tasks_.empty() || stop_; });
           if (stop_ && tasks_.empty()) {
             break;
@@ -236,7 +236,7 @@ TaskSystemParallelThreadPoolSleeping::~TaskSystemParallelThreadPoolSleeping() {
     std::unique_lock<std::mutex> lg(mtx_);
     this->stop_ = true;
   }
-  cv_task_.notify_all();
+  cv_ready_.notify_all();
 
   for (auto &t : ths_) {
     if (t.joinable()) {
@@ -265,7 +265,7 @@ void TaskSystemParallelThreadPoolSleeping::run(IRunnable *runnable,
       tasks_.push(i);
     }
   }
-  cv_task_.notify_all();
+  cv_ready_.notify_all();
 
   std::unique_lock<std::mutex> lg(mtx_);
   cv_done_.wait(lg, [this]() { return task_remained_ == 0; });

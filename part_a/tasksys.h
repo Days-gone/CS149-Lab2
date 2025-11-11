@@ -94,7 +94,7 @@ public:
   int task_total_;
   int task_remained_;
   std::queue<int> tasks_;
-  std::condition_variable cv_task_;
+  std::condition_variable cv_ready_;
   std::condition_variable cv_done_;
   std::vector<std::thread> ths_;
   IRunnable* cur_func_;
