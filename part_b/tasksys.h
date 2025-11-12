@@ -2,12 +2,14 @@
 #define _TASKSYS_H
 
 #include "itasksys.h"
+#include <atomic>
 #include <condition_variable>
 #include <mutex>
 #include <queue>
 #include <set>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 /*
@@ -70,38 +72,43 @@ class TaskSystemParallelThreadPoolSleeping : public ITaskSystem {
 public:
   TaskSystemParallelThreadPoolSleeping(int num_threads);
   ~TaskSystemParallelThreadPoolSleeping();
-  const char *name();
-  void run(IRunnable *runnable, int num_total_tasks);
+  const char *name() override;
+  void run(IRunnable *runnable, int num_total_tasks) override;
   TaskID runAsyncWithDeps(IRunnable *runnable, int num_total_tasks,
-                          const std::vector<TaskID> &deps);
-  void sync();
+                          const std::vector<TaskID> &deps) override;
+  void sync() override;
 
-  struct TaskArgs {
-    int idx{0};
-    int total{0};
-    TaskID global_id;
+  struct BatchWork {
+    TaskID batch_id;
+    std::atomic_int next_idx_{0};
+    std::atomic_int remained_{0};
+    int total_work{0};
     IRunnable *func{nullptr};
     std::vector<TaskID> deps;
-    public:
-    TaskArgs(int idx, int total, int global_id, IRunnable* func, std::vector<TaskID> deps) : idx(idx),total(total), global_id(global_id), func(func) {
-      this->deps = deps;
-    }
-    TaskArgs() = default;
+
+    BatchWork(int total, TaskID id, IRunnable *f, const std::vector<TaskID> &d)
+        : batch_id(id), remained_(total), total_work(total), func(f), deps(d) {}
+    BatchWork() = default;
   };
 
+private:
+  void updateQueue();
+
   int num_threads_;
-  int taskid_gennerator_;
-  int pending_batches_;
-  bool stop_;
+  int next_batch_idx_{0};
+  int pending_batches_{0};
+  bool stop_{false};
+
   std::mutex mtx_;
-  std::set<TaskID> done_;
-  std::unordered_map<TaskID, int> count_;
+  std::unordered_set<TaskID> done_;
+  std::unordered_map<TaskID, std::unique_ptr<BatchWork>> bw_map_;
+
   std::vector<std::thread> ths_;
-  std::queue<TaskArgs> wait_queue_;
-  std::queue<TaskArgs> ready_queue_;
+  std::queue<BatchWork *> wait_queue_;
+  std::queue<BatchWork *> ready_queue_;
+
   std::condition_variable cv_done_;
   std::condition_variable cv_ready_;
-
 };
 
 #endif

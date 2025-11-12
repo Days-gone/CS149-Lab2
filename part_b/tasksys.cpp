@@ -1,6 +1,8 @@
 #include "tasksys.h"
 #include "itasksys.h"
+#include <memory>
 #include <mutex>
+#include <queue>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -139,67 +141,95 @@ const char *TaskSystemParallelThreadPoolSleeping::name() {
   return "Parallel + Thread Pool + Sleep";
 }
 
+void TaskSystemParallelThreadPoolSleeping::updateQueue() {
+  size_t n = wait_queue_.size();
+  bool promoted = false;
+  for (size_t i = 0; i < n; i++) {
+    BatchWork *bw = wait_queue_.front();
+    wait_queue_.pop();
+    bool ready = true;
+    for (auto d : bw->deps) {
+      if (!done_.count(d)) {
+        ready = false;
+        break;
+      }
+    }
+    if (ready) {
+      ready_queue_.push(bw);
+      promoted = true;
+    } else {
+      wait_queue_.push(bw);
+    }
+  }
+  if (promoted)
+    cv_ready_.notify_all();
+}
+
 TaskSystemParallelThreadPoolSleeping::TaskSystemParallelThreadPoolSleeping(
     int num_threads)
-    : ITaskSystem(num_threads), num_threads_(num_threads),
-      taskid_gennerator_(0), pending_batches_(0), stop_(false) {
-  ths_.reserve(num_threads_);
+    : ITaskSystem(num_threads), num_threads_(num_threads) {
   for (int i = 0; i < num_threads_; i++) {
     ths_.emplace_back([this]() {
       while (true) {
-        // 尝试从ready queue获取任务
-        TaskArgs local_task;
+        BatchWork *bw = nullptr;
+        int idx = -1;
+        int total = -1;
+        IRunnable *fn = nullptr;
+
         {
-          std::unique_lock<std::mutex> lg(mtx_);
-          cv_ready_.wait(
-              lg, [this]() { return !this->ready_queue_.empty() || stop_; });
-          if (this->ready_queue_.empty() && stop_) {
+          std::unique_lock<std::mutex> lk(mtx_);
+          cv_ready_.wait(lk, [this] { return stop_ || !ready_queue_.empty(); });
+          if (stop_ && ready_queue_.empty())
             break;
+
+          bool found = false;
+          size_t qn = ready_queue_.size();
+          // 轮转查找可分配任务
+          for (size_t r = 0; r < qn; r++) {
+            BatchWork *cand = ready_queue_.front();
+            ready_queue_.pop();
+            int got = cand->next_idx_.fetch_add(1);
+            if (got < cand->total_work) {
+              ready_queue_.push(cand); // 轮转
+              bw = cand;
+              idx = got;
+              total = cand->total_work;
+              fn = cand->func;
+              found = true;
+              break;
+            } else {
+              // 任务索引已分发完，放回原队列位置
+              ready_queue_.push(cand);
+            }
           }
-          local_task = ready_queue_.front();
-          ready_queue_.pop();
+          if (!found) {
+            // 没有可执行 index，继续等待新提升
+            continue;
+          }
         }
 
-        // 开始执行任务
-        local_task.func->runTask(local_task.idx, local_task.total);
+        fn->runTask(idx, total);
 
         {
-          // 检查这次执行完成后，是否本批次任务全部执行完
-          std::unique_lock<std::mutex> lg(mtx_);
-          count_[local_task.global_id]++;
-
-          // 是否需要修改ready & wait queue
-          if (count_[local_task.global_id] == local_task.total) {
-            this->done_.insert(local_task.global_id);
+          std::unique_lock<std::mutex> lk(mtx_);
+          int left_after = bw->remained_.fetch_sub(1) - 1;
+          if (left_after == 0) {
+            done_.insert(bw->batch_id);
             pending_batches_--;
-            cv_done_.notify_all();
-
-            std::vector<TaskArgs> temp;
-            bool promote = false;
-            while (!wait_queue_.empty()) {
-              auto task = wait_queue_.front();
-              wait_queue_.pop();
-              bool is_ready = true;
-              for (auto &bid : task.deps) {
-                if (this->done_.count(bid) == 0) {
-                  is_ready = false;
-                  break;
-                }
-              }
-              if (is_ready) {
-                this->ready_queue_.push(task);
-                promote = true;
-              } else {
-                temp.emplace_back(task);
-              }
+            // 从 ready_queue_ 移除该批
+            std::queue<BatchWork *> tmp;
+            while (!ready_queue_.empty()) {
+              BatchWork *cur = ready_queue_.front();
+              ready_queue_.pop();
+              if (cur != bw)
+                tmp.push(cur);
             }
-
-            for (auto &task : temp) {
-              this->wait_queue_.push(std::move(task));
-            }
-            if (promote) {
+            ready_queue_.swap(tmp);
+            updateQueue();
+            if (pending_batches_ == 0)
+              cv_done_.notify_all();
+            if (!ready_queue_.empty())
               cv_ready_.notify_all();
-            }
           }
         }
       }
@@ -209,16 +239,13 @@ TaskSystemParallelThreadPoolSleeping::TaskSystemParallelThreadPoolSleeping(
 
 TaskSystemParallelThreadPoolSleeping::~TaskSystemParallelThreadPoolSleeping() {
   {
-    std::lock_guard<std::mutex> lg(mtx_);
+    std::lock_guard<std::mutex> lk(mtx_);
     stop_ = true;
   }
   cv_ready_.notify_all();
-
-  for (auto &t : ths_) {
+  for (auto &t : ths_)
     if (t.joinable())
       t.join();
-  }
-  ths_.clear();
 }
 
 void TaskSystemParallelThreadPoolSleeping::run(IRunnable *runnable,
@@ -229,41 +256,38 @@ void TaskSystemParallelThreadPoolSleeping::run(IRunnable *runnable,
 
 TaskID TaskSystemParallelThreadPoolSleeping::runAsyncWithDeps(
     IRunnable *runnable, int num_total_tasks, const std::vector<TaskID> &deps) {
-  std::lock_guard<std::mutex> lg(mtx_);
-  TaskID this_batch_taskid = this->taskid_gennerator_++;
+  std::lock_guard<std::mutex> lk(mtx_);
+  
+  TaskID id = next_batch_idx_++;
+  std::unique_ptr<BatchWork> up(
+      new BatchWork(num_total_tasks, id, runnable, deps));
+  BatchWork *raw = up.get();
+  bw_map_[id] = std::move(up);
 
-  // fast return
   if (num_total_tasks == 0) {
-    done_.insert(this_batch_taskid);
-    cv_done_.notify_all();
-    return this_batch_taskid;
+    done_.insert(id);
+    updateQueue();
+    return id;
   }
 
   pending_batches_++;
-  bool deps_ready = true;
-  for (auto &d : deps) {
-    if (done_.count(d) == 0) {
-      deps_ready = false;
+  bool ready = true;
+  for (auto d : deps) {
+    if (!done_.count(d)) {
+      ready = false;
       break;
     }
   }
-
-  for (int i = 0; i < num_total_tasks; i++) {
-    TaskArgs ta{i, num_total_tasks, this_batch_taskid, runnable, deps};
-    if (deps_ready) {
-      ready_queue_.push(ta);
-    } else {
-      wait_queue_.push(ta);
-    }
-  }
-
-  if (deps_ready) {
+  if (ready) {
+    ready_queue_.push(raw);
     cv_ready_.notify_all();
+  } else {
+    wait_queue_.push(raw);
   }
-  return this_batch_taskid;
+  return id;
 }
 
 void TaskSystemParallelThreadPoolSleeping::sync() {
-  std::unique_lock<std::mutex> lg(mtx_);
-  cv_done_.wait(lg, [this]() { return pending_batches_ == 0; });
+  std::unique_lock<std::mutex> lk(mtx_);
+  cv_done_.wait(lk, [this]() { return pending_batches_ == 0; });
 }
