@@ -182,32 +182,22 @@ TaskSystemParallelThreadPoolSleeping::TaskSystemParallelThreadPoolSleeping(
           if (stop_ && ready_queue_.empty())
             break;
 
-          bool found = false;
-          size_t qn = ready_queue_.size();
-          // 轮转查找可分配任务
-          for (size_t r = 0; r < qn; r++) {
-            BatchWork *cand = ready_queue_.front();
-            ready_queue_.pop();
-            int got = cand->next_idx_.fetch_add(1);
-            if (got < cand->total_work) {
-              ready_queue_.push(cand); // 轮转
-              bw = cand;
-              idx = got;
-              total = cand->total_work;
-              fn = cand->func;
-              found = true;
-              break;
-            } else {
-              // 任务索引已分发完，放回原队列位置
-              ready_queue_.push(cand);
-            }
-          }
-          if (!found) {
-            // 没有可执行 index，继续等待新提升
+          bw = ready_queue_.front();
+          int got = bw->next_idx_.fetch_add(1);
+          if (got >= bw->total_work) {
+            cv_ready_.wait(lk, [this, bw] {
+              return stop_ || ready_queue_.empty() ||
+                     ready_queue_.front() != bw;
+            });
             continue;
           }
+
+          idx = got;
+          total = bw->total_work;
+          fn = bw->func;
         }
 
+        // 锁外执行
         fn->runTask(idx, total);
 
         {
@@ -216,20 +206,25 @@ TaskSystemParallelThreadPoolSleeping::TaskSystemParallelThreadPoolSleeping(
           if (left_after == 0) {
             done_.insert(bw->batch_id);
             pending_batches_--;
-            // 从 ready_queue_ 移除该批
-            std::queue<BatchWork *> tmp;
-            while (!ready_queue_.empty()) {
-              BatchWork *cur = ready_queue_.front();
+            // 防御性编程
+            if (!ready_queue_.empty() && ready_queue_.front() == bw) {
               ready_queue_.pop();
-              if (cur != bw)
-                tmp.push(cur);
+            } else {
+              std::queue<BatchWork *> tmp;
+              while (!ready_queue_.empty()) {
+                BatchWork *cur = ready_queue_.front();
+                ready_queue_.pop();
+                if (cur != bw)
+                  tmp.push(cur);
+              }
+              ready_queue_.swap(tmp);
             }
-            ready_queue_.swap(tmp);
+
+            // 提升可执行批次并通知
             updateQueue();
             if (pending_batches_ == 0)
               cv_done_.notify_all();
-            if (!ready_queue_.empty())
-              cv_ready_.notify_all();
+            cv_ready_.notify_all();
           }
         }
       }
@@ -257,7 +252,7 @@ void TaskSystemParallelThreadPoolSleeping::run(IRunnable *runnable,
 TaskID TaskSystemParallelThreadPoolSleeping::runAsyncWithDeps(
     IRunnable *runnable, int num_total_tasks, const std::vector<TaskID> &deps) {
   std::lock_guard<std::mutex> lk(mtx_);
-  
+
   TaskID id = next_batch_idx_++;
   std::unique_ptr<BatchWork> up(
       new BatchWork(num_total_tasks, id, runnable, deps));
